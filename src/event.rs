@@ -800,6 +800,15 @@ pub enum Ime {
     /// also stop issuing IME related requests like [`Window::set_ime_cursor_area`] and clear
     /// pending preedit text.
     Disabled,
+
+    /// The IME's whole view of the focused text field, sent instead of
+    /// [`Preedit`][Self::Preedit] / [`Commit`][Self::Commit] by IMEs that
+    /// edit a mirrored buffer (Android GameActivity): `text` includes any
+    /// composition inline, `selection` and `compose` are byte ranges into
+    /// it. Make the field match, and report its state back with
+    /// `AndroidApp::set_text_input_state` when it changes for any other
+    /// reason (focus, a tap moving the caret, the app setting the value).
+    TextState { text: String, selection: (usize, usize), compose: Option<(usize, usize)> },
 }
 
 /// Describes touch-screen input state.

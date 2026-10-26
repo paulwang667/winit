@@ -39,3 +39,12 @@ The migration guide could reference other migration examples in the current
 changelog entry.
 
 ## Unreleased
+
+### Added
+
+- Add `Ime::TextState`, the whole text field as an IME that edits a mirror of
+  it reports it (text with any composition inline, selection and composition
+  as byte ranges).
+- On Android with GameActivity, IME text input arrives as `Ime::TextState`,
+  and the IME's action key (Enter / Done / Send) as an Enter key press;
+  both were previously dropped.

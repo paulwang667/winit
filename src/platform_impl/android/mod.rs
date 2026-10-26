@@ -362,6 +362,45 @@ impl<T: 'static> EventLoop<T> {
         self.pending_redraw = pending_redraw;
     }
 
+    /// GameActivity reports the IME's whole editor state (text, selection,
+    /// compose region) rather than deltas; pass it on as `Ime::TextState`
+    /// with the Java (UTF-16) offsets turned into byte offsets.
+    #[cfg(feature = "android-game-activity")]
+    fn handle_text_event<F>(
+        &mut self,
+        state: &android_activity::input::TextInputState,
+        callback: &mut F,
+    ) where
+        F: FnMut(event::Event<T>, &RootAEL),
+    {
+        let text = &state.text;
+        let byte_at = |utf16: usize| -> usize {
+            let mut units = 0;
+            for (i, c) in text.char_indices() {
+                if units >= utf16 {
+                    return i;
+                }
+                units += c.len_utf16();
+            }
+            text.len()
+        };
+        let selection = (byte_at(state.selection.start), byte_at(state.selection.end));
+        let compose = state
+            .compose_region
+            .map(|c| (byte_at(c.start.min(c.end)), byte_at(c.start.max(c.end))))
+            .filter(|(start, end)| start < end);
+        trace!("IME state text={text:?} sel={selection:?} compose={compose:?}");
+        let event = event::Event::WindowEvent {
+            window_id: window::WindowId(WindowId),
+            event: event::WindowEvent::Ime(event::Ime::TextState {
+                text: text.clone(),
+                selection,
+                compose,
+            }),
+        };
+        callback(event, self.window_target());
+    }
+
     fn handle_input_event<F>(
         &mut self,
         android_app: &AndroidApp,
@@ -471,6 +510,39 @@ impl<T: 'static> EventLoop<T> {
                         };
                         callback(event, self.window_target());
                     },
+                }
+            },
+            #[cfg(feature = "android-game-activity")]
+            InputEvent::TextEvent(state) => {
+                self.handle_text_event(state, callback);
+            },
+            // The IME's action key (Enter / Done / Send) when nothing is
+            // composing. Surface it as an Enter press so apps see one key.
+            #[cfg(feature = "android-game-activity")]
+            InputEvent::TextAction(action) => {
+                trace!("IME action {action:?}");
+                for state in [event::ElementState::Pressed, event::ElementState::Released] {
+                    let event = event::Event::WindowEvent {
+                        window_id: window::WindowId(WindowId),
+                        event: event::WindowEvent::KeyboardInput {
+                            device_id: event::DeviceId(DeviceId(0)),
+                            event: event::KeyEvent {
+                                state,
+                                physical_key: crate::keyboard::PhysicalKey::Code(
+                                    crate::keyboard::KeyCode::Enter,
+                                ),
+                                logical_key: crate::keyboard::Key::Named(
+                                    crate::keyboard::NamedKey::Enter,
+                                ),
+                                location: crate::keyboard::KeyLocation::Standard,
+                                repeat: false,
+                                text: None,
+                                platform_specific: KeyEventExtra {},
+                            },
+                            is_synthetic: true,
+                        },
+                    };
+                    callback(event, self.window_target());
                 }
             },
             _ => {
