@@ -4,6 +4,7 @@ mod app_state;
 mod event_loop;
 mod monitor;
 mod notification_center;
+mod text_input;
 mod view;
 mod view_controller;
 mod window;

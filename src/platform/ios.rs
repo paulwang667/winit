@@ -163,6 +163,27 @@ pub trait WindowExtIOS {
     /// is also called for you.
     fn set_preferred_status_bar_style(&self, status_bar_style: StatusBarStyle);
 
+    /// Hands the soft keyboard a copy of the focused text field, or `None`
+    /// when no field has focus.
+    ///
+    /// With a state set, the view implements `UITextInput` over this copy:
+    /// input methods compose in it (Chinese pinyin, Japanese, accents), and
+    /// every edit they make is reported as
+    /// [`Ime::TextState`](crate::event::Ime::TextState) instead of
+    /// `KeyboardInput` — make the field match. Call this again whenever the
+    /// field changes for another reason (focus moves, a tap moves the
+    /// caret, the app sets the value). The return key with nothing being
+    /// composed still arrives as an Enter press.
+    ///
+    /// Without a state (the default), typing arrives as `KeyboardInput` as
+    /// before and input methods cannot compose.
+    fn set_text_input_state(&self, state: Option<TextInputState>);
+
+    /// Sets the soft keyboard's layout, return key and suggestions
+    /// (`UITextInputTraits`). Takes effect immediately, also while the
+    /// keyboard is up.
+    fn set_text_input_traits(&self, traits: TextInputTraits);
+
     /// Sets whether the [`Window`] should recognize pinch gestures.
     ///
     /// The default is to not recognize gestures.
@@ -195,6 +216,16 @@ pub trait WindowExtIOS {
 }
 
 impl WindowExtIOS for Window {
+    #[inline]
+    fn set_text_input_state(&self, state: Option<TextInputState>) {
+        self.window.maybe_queue_on_main(move |w| w.set_text_input_state(state))
+    }
+
+    #[inline]
+    fn set_text_input_traits(&self, traits: TextInputTraits) {
+        self.window.maybe_queue_on_main(move |w| w.set_text_input_traits(traits))
+    }
+
     #[inline]
     fn set_scale_factor(&self, scale_factor: f64) {
         self.window.maybe_queue_on_main(move |w| w.set_scale_factor(scale_factor))
@@ -424,6 +455,66 @@ bitflags::bitflags! {
         const ALL = ScreenEdge::TOP.bits() | ScreenEdge::LEFT.bits()
             | ScreenEdge::BOTTOM.bits() | ScreenEdge::RIGHT.bits();
     }
+}
+
+/// A focused text field as the soft keyboard sees it
+/// ([`WindowExtIOS::set_text_input_state`]): byte offsets into `text`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextInputState {
+    pub text: String,
+    pub selection: (usize, usize),
+    pub compose: Option<(usize, usize)>,
+}
+
+/// The soft keyboard's layout, return key and suggestions
+/// ([`WindowExtIOS::set_text_input_traits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextInputTraits {
+    pub keyboard: KeyboardType,
+    pub return_key: ReturnKeyType,
+    /// Hides what is typed and turns suggestions off (a password).
+    pub secure: bool,
+    pub autocorrect: bool,
+    /// Capitalizes the first letter of each sentence.
+    pub autocapitalize: bool,
+}
+
+impl Default for TextInputTraits {
+    fn default() -> Self {
+        Self {
+            keyboard: KeyboardType::Default,
+            return_key: ReturnKeyType::Default,
+            secure: false,
+            autocorrect: true,
+            autocapitalize: true,
+        }
+    }
+}
+
+/// The soft keyboard's layout (`UIKeyboardType`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyboardType {
+    #[default]
+    Default,
+    NumberPad,
+    DecimalPad,
+    PhonePad,
+    EmailAddress,
+    Url,
+}
+
+/// The soft keyboard's return key (`UIReturnKeyType`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReturnKeyType {
+    #[default]
+    Default,
+    Send,
+    Search,
+    Go,
+    Done,
+    Next,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

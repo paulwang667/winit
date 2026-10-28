@@ -2,21 +2,28 @@
 use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
-use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
+use objc2_foundation::{
+    CGFloat, CGPoint, CGRect, CGSize, MainThreadMarker, NSArray, NSInteger, NSObject, NSRange,
+    NSSet, NSString,
+};
 use objc2_ui_kit::{
     UICoordinateSpace, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
     UIGestureRecognizerDelegate, UIGestureRecognizerState, UIKeyInput, UIPanGestureRecognizer,
     UIPinchGestureRecognizer, UIResponder, UIRotationGestureRecognizer, UITapGestureRecognizer,
-    UITextInputTraits, UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView,
+    UITextInput, UITextInputStringTokenizer, UITextInputTraits, UITextPosition, UITextRange,
+    UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView,
 };
 
 use super::app_state::{self, EventWrapper};
+use super::text_input::{offset_of, range_of, WinitTextPosition, WinitTextRange};
 use super::window::WinitUIWindow;
 use crate::dpi::PhysicalPosition;
-use crate::event::{ElementState, Event, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
+use crate::event::{ElementState, Event, Force, Ime, KeyEvent, Touch, TouchPhase, WindowEvent};
 use crate::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKeyCode, PhysicalKey};
+use crate::platform::ios::{KeyboardType, ReturnKeyType, TextInputState, TextInputTraits};
+use crate::platform_impl::ios_text_mirror::{InsertAction, TextMirror};
 use crate::platform_impl::platform::DEVICE_ID;
 use crate::platform_impl::KeyEventExtra;
 use crate::window::{WindowAttributes, WindowId as RootWindowId};
@@ -31,6 +38,17 @@ pub struct WinitViewState {
     rotation_last_delta: Cell<CGFloat>,
     pinch_last_delta: Cell<CGFloat>,
     pan_last_delta: Cell<CGPoint>,
+
+    /// The focused field the app handed over
+    /// (`WindowExtIOS::set_text_input_state`); `None` keeps the plain
+    /// `UIKeyInput` behaviour.
+    text: RefCell<Option<TextMirror>>,
+    traits: Cell<TextInputTraits>,
+    /// UIKit's `inputDelegate` (a `UITextInputDelegate`).
+    input_delegate: RefCell<Option<Retained<AnyObject>>>,
+    tokenizer: RefCell<Option<Retained<UITextInputStringTokenizer>>>,
+    /// The caret's rect in view points (`Window::set_ime_cursor_area`).
+    cursor_area: Cell<CGRect>,
 }
 
 declare_class!(
@@ -333,22 +351,309 @@ declare_class!(
     }
 
     unsafe impl UITextInputTraits for WinitView {
+        #[method(keyboardType)]
+        fn keyboard_type(&self) -> NSInteger {
+            // UIKeyboardType
+            match self.ivars().traits.get().keyboard {
+                KeyboardType::NumberPad => 4,
+                KeyboardType::DecimalPad => 8,
+                KeyboardType::PhonePad => 5,
+                KeyboardType::EmailAddress => 7,
+                KeyboardType::Url => 3,
+                _ => 0,
+            }
+        }
+
+        #[method(returnKeyType)]
+        fn return_key_type(&self) -> NSInteger {
+            // UIReturnKeyType
+            match self.ivars().traits.get().return_key {
+                ReturnKeyType::Go => 1,
+                ReturnKeyType::Next => 4,
+                ReturnKeyType::Search => 6,
+                ReturnKeyType::Send => 7,
+                ReturnKeyType::Done => 9,
+                _ => 0,
+            }
+        }
+
+        #[method(isSecureTextEntry)]
+        fn is_secure_text_entry(&self) -> bool {
+            self.ivars().traits.get().secure
+        }
+
+        #[method(autocorrectionType)]
+        fn autocorrection_type(&self) -> NSInteger {
+            // UITextAutocorrectionType: No = 1, Yes = 2
+            if self.ivars().traits.get().autocorrect { 2 } else { 1 }
+        }
+
+        #[method(autocapitalizationType)]
+        fn autocapitalization_type(&self) -> NSInteger {
+            // UITextAutocapitalizationType: None = 0, Sentences = 2
+            if self.ivars().traits.get().autocapitalize { 2 } else { 0 }
+        }
     }
 
     unsafe impl UIKeyInput for WinitView {
         #[method(hasText)]
         fn has_text(&self) -> bool {
-            true
+            self.ivars().text.borrow().as_ref().map_or(true, |m| !m.text.is_empty())
         }
 
         #[method(insertText:)]
         fn insert_text(&self, text: &NSString) {
-            self.handle_insert_text(text)
+            let action = self.ivars().text.borrow().as_ref().map(|m| m.classify_insert(&text.to_string()));
+            match action {
+                None | Some(InsertAction::Enter) => self.handle_insert_text(text),
+                Some(InsertAction::Edit) => self.edit(|m| m.insert(&text.to_string())),
+            }
         }
 
         #[method(deleteBackward)]
         fn delete_backward(&self) {
-            self.handle_delete_backward()
+            if self.ivars().text.borrow().is_some() {
+                self.edit(TextMirror::delete_backward);
+            } else {
+                self.handle_delete_backward()
+            }
+        }
+    }
+
+    unsafe impl UITextInput for WinitView {
+        #[method_id(textInRange:)]
+        fn text_in_range(&self, range: &UITextRange) -> Option<Retained<NSString>> {
+            (|| {
+                let (a, b) = range_of(range)?;
+                let text = self.ivars().text.borrow();
+                let m = text.as_ref()?;
+                Some(NSString::from_str(&m.text[m.byte_at(a)..m.byte_at(b)]))
+            })()
+        }
+
+        #[method(replaceRange:withText:)]
+        fn replace_range(&self, range: &UITextRange, text: &NSString) {
+            if let Some(r) = range_of(range) {
+                self.edit(|m| m.replace(r, &text.to_string()));
+            }
+        }
+
+        #[method_id(selectedTextRange)]
+        fn selected_text_range(&self) -> Option<Retained<UITextRange>> {
+            (|| {
+                let (a, b) = self.utf16(|m| m.selection)?;
+                Some(WinitTextRange::between(MainThreadMarker::from(self), a, b))
+            })()
+        }
+
+        #[method(setSelectedTextRange:)]
+        fn set_selected_text_range(&self, range: Option<&UITextRange>) {
+            if let Some(r) = range.and_then(range_of) {
+                self.edit(|m| m.set_selection(r));
+            }
+        }
+
+        #[method_id(markedTextRange)]
+        fn marked_text_range(&self) -> Option<Retained<UITextRange>> {
+            (|| {
+                let text = self.ivars().text.borrow();
+                let m = text.as_ref()?;
+                let (a, b) = m.marked?;
+                let (a, b) = (m.utf16_at(a), m.utf16_at(b));
+                Some(WinitTextRange::between(MainThreadMarker::from(self), a, b))
+            })()
+        }
+
+        #[method_id(markedTextStyle)]
+        fn marked_text_style(&self) -> Option<Retained<AnyObject>> {
+            None
+        }
+
+        #[method(setMarkedTextStyle:)]
+        fn set_marked_text_style(&self, _style: Option<&AnyObject>) {}
+
+        #[method(setMarkedText:selectedRange:)]
+        fn set_marked_text(&self, text: Option<&NSString>, selected: NSRange) {
+            let text = text.map(|t| t.to_string()).unwrap_or_default();
+            let sel = (selected.location, selected.location + selected.length);
+            self.edit(|m| m.set_marked(&text, sel));
+        }
+
+        #[method(unmarkText)]
+        fn unmark_text(&self) {
+            self.edit(TextMirror::unmark);
+        }
+
+        #[method_id(beginningOfDocument)]
+        fn beginning_of_document(&self) -> Retained<UITextPosition> {
+            WinitTextPosition::at(MainThreadMarker::from(self), 0)
+        }
+
+        #[method_id(endOfDocument)]
+        fn end_of_document(&self) -> Retained<UITextPosition> {
+            let end = self.ivars().text.borrow().as_ref().map_or(0, TextMirror::utf16_len);
+            WinitTextPosition::at(MainThreadMarker::from(self), end)
+        }
+
+        #[method_id(textRangeFromPosition:toPosition:)]
+        fn text_range_from_position(
+            &self,
+            from: &UITextPosition,
+            to: &UITextPosition,
+        ) -> Option<Retained<UITextRange>> {
+            (|| {
+                Some(WinitTextRange::between(MainThreadMarker::from(self), offset_of(from)?, offset_of(to)?))
+            })()
+        }
+
+        #[method_id(positionFromPosition:offset:)]
+        fn position_from_position(
+            &self,
+            position: &UITextPosition,
+            offset: NSInteger,
+        ) -> Option<Retained<UITextPosition>> {
+            self.position_at(position, offset)
+        }
+
+        #[method_id(positionFromPosition:inDirection:offset:)]
+        fn position_from_position_in_direction(
+            &self,
+            position: &UITextPosition,
+            direction: NSInteger,
+            offset: NSInteger,
+        ) -> Option<Retained<UITextPosition>> {
+            // UITextLayoutDirection: Right = 2, Left = 3, Up = 4, Down = 5.
+            // One line: up and down stay put.
+            let delta = match direction {
+                2 => offset,
+                3 => -offset,
+                _ => 0,
+            };
+            self.position_at(position, delta)
+        }
+
+        #[method(comparePosition:toPosition:)]
+        fn compare_position(&self, a: &UITextPosition, b: &UITextPosition) -> NSInteger {
+            // NSComparisonResult
+            match offset_of(a).cmp(&offset_of(b)) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }
+        }
+
+        #[method(offsetFromPosition:toPosition:)]
+        fn offset_from_position(&self, from: &UITextPosition, to: &UITextPosition) -> NSInteger {
+            match (offset_of(from), offset_of(to)) {
+                (Some(a), Some(b)) => b as NSInteger - a as NSInteger,
+                _ => 0,
+            }
+        }
+
+        #[method_id(inputDelegate)]
+        fn input_delegate(&self) -> Option<Retained<AnyObject>> {
+            self.ivars().input_delegate.borrow().clone()
+        }
+
+        #[method(setInputDelegate:)]
+        fn set_input_delegate(&self, delegate: Option<&AnyObject>) {
+            // SAFETY: a live object UIKit just handed us.
+            *self.ivars().input_delegate.borrow_mut() = delegate.and_then(|d| unsafe {
+                Retained::retain(d as *const AnyObject as *mut AnyObject)
+            });
+        }
+
+        #[method_id(tokenizer)]
+        fn tokenizer(&self) -> Retained<UITextInputStringTokenizer> {
+            let mut slot = self.ivars().tokenizer.borrow_mut();
+            slot.get_or_insert_with(|| unsafe {
+                UITextInputStringTokenizer::initWithTextInput(
+                    MainThreadMarker::from(self).alloc(),
+                    self,
+                )
+            })
+            .clone()
+        }
+
+        #[method_id(positionWithinRange:farthestInDirection:)]
+        fn position_within_range(
+            &self,
+            range: &UITextRange,
+            direction: NSInteger,
+        ) -> Option<Retained<UITextPosition>> {
+            (|| {
+                let (a, b) = range_of(range)?;
+                // Left (3) and up (4) mean the start.
+                let at = if matches!(direction, 3 | 4) { a } else { b };
+                Some(WinitTextPosition::at(MainThreadMarker::from(self), at))
+            })()
+        }
+
+        #[method_id(characterRangeByExtendingPosition:inDirection:)]
+        fn character_range_by_extending(
+            &self,
+            position: &UITextPosition,
+            direction: NSInteger,
+        ) -> Option<Retained<UITextRange>> {
+            (|| {
+                let at = offset_of(position)?;
+                let len = self.ivars().text.borrow().as_ref().map_or(0, TextMirror::utf16_len);
+                let (a, b) = if matches!(direction, 3 | 4) {
+                    (at.saturating_sub(1), at)
+                } else {
+                    (at, (at + 1).min(len))
+                };
+                Some(WinitTextRange::between(MainThreadMarker::from(self), a, b))
+            })()
+        }
+
+        #[method(baseWritingDirectionForPosition:inDirection:)]
+        fn base_writing_direction(&self, _position: &UITextPosition, _direction: NSInteger) -> NSInteger {
+            0 // NSWritingDirectionLeftToRight
+        }
+
+        #[method(setBaseWritingDirection:forRange:)]
+        fn set_base_writing_direction(&self, _direction: NSInteger, _range: &UITextRange) {}
+
+        #[method(firstRectForRange:)]
+        fn first_rect_for_range(&self, _range: &UITextRange) -> CGRect {
+            self.ivars().cursor_area.get()
+        }
+
+        #[method(caretRectForPosition:)]
+        fn caret_rect_for_position(&self, _position: &UITextPosition) -> CGRect {
+            let r = self.ivars().cursor_area.get();
+            CGRect { origin: r.origin, size: CGSize { width: 2.0, height: r.size.height } }
+        }
+
+        #[method_id(selectionRectsForRange:)]
+        fn selection_rects_for_range(&self, _range: &UITextRange) -> Retained<NSArray<NSObject>> {
+            NSArray::new()
+        }
+
+        #[method_id(closestPositionToPoint:)]
+        fn closest_position_to_point(&self, _point: CGPoint) -> Option<Retained<UITextPosition>> {
+            (|| {
+                let (_, b) = self.utf16(|m| m.selection)?;
+                Some(WinitTextPosition::at(MainThreadMarker::from(self), b))
+            })()
+        }
+
+        #[method_id(closestPositionToPoint:withinRange:)]
+        fn closest_position_to_point_within(
+            &self,
+            _point: CGPoint,
+            range: &UITextRange,
+        ) -> Option<Retained<UITextPosition>> {
+            (|| {
+                let (_, b) = range_of(range)?;
+                Some(WinitTextPosition::at(MainThreadMarker::from(self), b))
+            })()
+        }
+
+        #[method_id(characterRangeAtPoint:)]
+        fn character_range_at_point(&self, _point: CGPoint) -> Option<Retained<UITextRange>> {
+            None
         }
     }
 );
@@ -368,6 +673,12 @@ impl WinitView {
             rotation_last_delta: Cell::new(0.0),
             pinch_last_delta: Cell::new(0.0),
             pan_last_delta: Cell::new(CGPoint { x: 0.0, y: 0.0 }),
+
+            text: RefCell::new(None),
+            traits: Cell::new(TextInputTraits::default()),
+            input_delegate: RefCell::new(None),
+            tokenizer: RefCell::new(None),
+            cursor_area: Cell::new(CGRect::default()),
         });
         let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
 
@@ -538,6 +849,85 @@ impl WinitView {
         }
         let mtm = MainThreadMarker::new().unwrap();
         app_state::handle_nonuser_events(mtm, touch_events);
+    }
+
+    /// The position `offset` UTF-16 units from `position`, if inside the text.
+    fn position_at(
+        &self,
+        position: &UITextPosition,
+        offset: NSInteger,
+    ) -> Option<Retained<UITextPosition>> {
+        let at = offset_of(position)? as NSInteger + offset;
+        let len = self.ivars().text.borrow().as_ref().map_or(0, TextMirror::utf16_len);
+        (0..=len as NSInteger)
+            .contains(&at)
+            .then(|| WinitTextPosition::at(MainThreadMarker::from(self), at as usize))
+    }
+
+    /// `f`'s byte range of the mirror, in UTF-16 offsets.
+    fn utf16(&self, f: impl Fn(&TextMirror) -> (usize, usize)) -> Option<(usize, usize)> {
+        let text = self.ivars().text.borrow();
+        let m = text.as_ref()?;
+        let (a, b) = f(m);
+        Some((m.utf16_at(a), m.utf16_at(b)))
+    }
+
+    /// Applies an input method's edit to the mirror and, when it changed
+    /// anything, reports the new state as `Ime::TextState`.
+    fn edit(&self, f: impl FnOnce(&mut TextMirror) -> bool) {
+        let state = {
+            let mut text = self.ivars().text.borrow_mut();
+            let Some(m) = text.as_mut() else { return };
+            if !f(m) {
+                return;
+            }
+            Ime::TextState { text: m.text.clone(), selection: m.selection, compose: m.marked }
+        };
+        let Some(window) = self.window() else { return };
+        app_state::handle_nonuser_event(
+            MainThreadMarker::from(self),
+            EventWrapper::StaticEvent(Event::WindowEvent {
+                window_id: RootWindowId(window.id()),
+                event: WindowEvent::Ime(state),
+            }),
+        );
+    }
+
+    /// The app's field (`WindowExtIOS::set_text_input_state`). Tells the
+    /// input method the text changed under it, so it drops what it was
+    /// composing against the old text.
+    pub(crate) fn set_text_input_state(&self, state: Option<TextInputState>) {
+        let mirror = state.map(|s| TextMirror::from_state(s.text, s.selection, s.compose));
+        if *self.ivars().text.borrow() == mirror {
+            return;
+        }
+        let delegate = self.ivars().input_delegate.borrow().clone();
+        let me: &AnyObject = self.as_ref();
+        if let Some(d) = &delegate {
+            unsafe {
+                let _: () = msg_send![d, selectionWillChange: me];
+                let _: () = msg_send![d, textWillChange: me];
+            }
+        }
+        *self.ivars().text.borrow_mut() = mirror;
+        if let Some(d) = &delegate {
+            unsafe {
+                let _: () = msg_send![d, textDidChange: me];
+                let _: () = msg_send![d, selectionDidChange: me];
+            }
+        }
+    }
+
+    /// The keyboard's traits; reloads the keyboard when it is up.
+    pub(crate) fn set_text_input_traits(&self, traits: TextInputTraits) {
+        if self.ivars().traits.replace(traits) != traits && unsafe { self.isFirstResponder() } {
+            unsafe { self.reloadInputViews() };
+        }
+    }
+
+    /// The caret's rect in view points, for the candidate bar.
+    pub(crate) fn set_cursor_area(&self, rect: CGRect) {
+        self.ivars().cursor_area.set(rect);
     }
 
     fn handle_insert_text(&self, text: &NSString) {

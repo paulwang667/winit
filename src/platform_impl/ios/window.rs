@@ -363,8 +363,23 @@ impl Inner {
         warn!("`Window::set_window_icon` is ignored on iOS")
     }
 
-    pub fn set_ime_cursor_area(&self, _position: Position, _size: Size) {
-        warn!("`Window::set_ime_cursor_area` is ignored on iOS")
+    pub fn set_ime_cursor_area(&self, position: Position, size: Size) {
+        // View points: the view fills the window.
+        let scale = self.scale_factor();
+        let position = position.to_logical::<f64>(scale);
+        let size = size.to_logical::<f64>(scale);
+        self.view.set_cursor_area(CGRect {
+            origin: CGPoint { x: position.x as _, y: position.y as _ },
+            size: CGSize { width: size.width as _, height: size.height as _ },
+        });
+    }
+
+    pub fn set_text_input_state(&self, state: Option<crate::platform::ios::TextInputState>) {
+        self.view.set_text_input_state(state);
+    }
+
+    pub fn set_text_input_traits(&self, traits: crate::platform::ios::TextInputTraits) {
+        self.view.set_text_input_traits(traits);
     }
 
     /// Show / hide the keyboard. To show the keyboard, we call `becomeFirstResponder`,
