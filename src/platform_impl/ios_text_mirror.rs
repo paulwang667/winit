@@ -111,15 +111,17 @@ impl TextMirror {
         self.marked.take().is_some()
     }
 
-    /// The backspace key: removes the selection, or the `char` before the
-    /// caret. Ends any composition.
+    /// The backspace key: removes the selection, or the visible character
+    /// (grapheme cluster: an emoji with its skin tone, a flag, a letter
+    /// with its accent) before the caret. Ends any composition.
     pub fn delete_backward(&mut self) -> bool {
+        use unicode_segmentation::UnicodeSegmentation;
         let (a, b) = self.selection;
         let range = if a != b {
             (a, b)
         } else {
-            match self.text[..a].chars().next_back() {
-                Some(c) => (a - c.len_utf8(), a),
+            match self.text[..a].grapheme_indices(true).next_back() {
+                Some((start, _)) => (start, a),
                 None => return self.unmark(),
             }
         };
@@ -213,6 +215,15 @@ mod tests {
         assert_eq!((m.text.as_str(), m.selection), ("ho", (1, 1)));
         let mut m = mirror("", 0);
         assert!(!m.delete_backward(), "nothing to delete");
+    }
+
+    #[test]
+    fn delete_backward_removes_a_whole_visible_character() {
+        for text in ["👍🏽", "🇨🇳", "👨\u{200d}👩\u{200d}👧", "e\u{301}"] {
+            let mut m = mirror(&format!("a{text}"), 1 + text.len());
+            assert!(m.delete_backward());
+            assert_eq!(m.text, "a", "{text:?} goes in one press");
+        }
     }
 
     #[test]

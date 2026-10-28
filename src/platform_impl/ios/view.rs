@@ -427,8 +427,12 @@ declare_class!(
 
         #[method(autocorrectionType)]
         fn autocorrection_type(&self) -> NSInteger {
-            // UITextAutocorrectionType: No = 1, Yes = 2
-            if self.ivars().traits.get().autocorrect { 2 } else { 1 }
+            // UITextAutocorrectionType: No = 1, Yes = 2. Without a mirror
+            // (the app never called `set_text_input_state`) a correction's
+            // `replaceRange:` has nothing to edit and would vanish, so
+            // offer none.
+            let mirrored = self.ivars().text.borrow().is_some();
+            if mirrored && self.ivars().traits.get().autocorrect { 2 } else { 1 }
         }
 
         #[method(autocapitalizationType)]
