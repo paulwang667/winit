@@ -687,7 +687,9 @@ impl Inner {
     fn safe_area_screen_space(&self) -> CGRect {
         let bounds = self.window.bounds();
         if app_state::os_capabilities().safe_area {
-            let safe_area = self.window.safeAreaInsets();
+            let mut safe_area = self.window.safeAreaInsets();
+            // The soft keyboard covers the bottom too (see `WinitView`).
+            safe_area.bottom = safe_area.bottom.max(self.view.keyboard_overlap());
             let safe_bounds = CGRect {
                 origin: CGPoint {
                     x: bounds.origin.x + safe_area.left,

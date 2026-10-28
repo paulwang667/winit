@@ -20,7 +20,9 @@ use super::app_state::{self, EventWrapper};
 use super::text_input::{offset_of, range_of, WinitTextPosition, WinitTextRange};
 use super::window::WinitUIWindow;
 use crate::dpi::PhysicalPosition;
-use crate::event::{ElementState, Event, Force, Ime, KeyEvent, Touch, TouchPhase, WindowEvent};
+use crate::event::{
+    ElementState, Event, Force, Ime, KeyEvent, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
+};
 use crate::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKeyCode, PhysicalKey};
 use crate::platform::ios::{KeyboardType, ReturnKeyType, TextInputState, TextInputTraits};
 use crate::platform_impl::ios_text_mirror::{InsertAction, TextMirror};
@@ -49,6 +51,14 @@ pub struct WinitViewState {
     tokenizer: RefCell<Option<Retained<UITextInputStringTokenizer>>>,
     /// The caret's rect in view points (`Window::set_ime_cursor_area`).
     cursor_area: Cell<CGRect>,
+
+    /// How much of the window the soft keyboard covers, in points; folded
+    /// into the safe area the window reports.
+    keyboard_overlap: Cell<CGFloat>,
+    keyboard_observers: RefCell<Vec<Retained<NSObject>>>,
+    /// Trackpad and mouse-wheel scrolling (indirect touches only).
+    scroll_gesture_recognizer: RefCell<Option<Retained<UIPanGestureRecognizer>>>,
+    scroll_last: Cell<CGPoint>,
 }
 
 declare_class!(
@@ -333,6 +343,39 @@ declare_class!(
 
             let mtm = MainThreadMarker::new().unwrap();
             app_state::handle_nonuser_event(mtm, gesture_event);
+        }
+
+        #[method(scrollGesture:)]
+        fn scroll_gesture(&self, recognizer: &UIPanGestureRecognizer) {
+            let window = self.window().unwrap();
+            let translation = recognizer.translationInView(Some(self));
+            let last = match recognizer.state() {
+                UIGestureRecognizerState::Began => CGPoint { x: 0.0, y: 0.0 },
+                _ => self.ivars().scroll_last.get(),
+            };
+            self.ivars().scroll_last.set(translation);
+            let phase = match recognizer.state() {
+                UIGestureRecognizerState::Began => TouchPhase::Started,
+                UIGestureRecognizerState::Changed => TouchPhase::Moved,
+                UIGestureRecognizerState::Ended => TouchPhase::Ended,
+                _ => TouchPhase::Cancelled,
+            };
+            let scale = self.contentScaleFactor();
+            let delta = PhysicalPosition::new(
+                ((translation.x - last.x) * scale) as f64,
+                ((translation.y - last.y) * scale) as f64,
+            );
+            app_state::handle_nonuser_event(
+                MainThreadMarker::from(self),
+                EventWrapper::StaticEvent(Event::WindowEvent {
+                    window_id: RootWindowId(window.id()),
+                    event: WindowEvent::MouseWheel {
+                        device_id: DEVICE_ID,
+                        delta: MouseScrollDelta::PixelDelta(delta),
+                        phase,
+                    },
+                }),
+            );
         }
 
         #[method(canBecomeFirstResponder)]
@@ -679,10 +722,17 @@ impl WinitView {
             input_delegate: RefCell::new(None),
             tokenizer: RefCell::new(None),
             cursor_area: Cell::new(CGRect::default()),
+
+            keyboard_overlap: Cell::new(0.0),
+            keyboard_observers: RefCell::new(Vec::new()),
+            scroll_gesture_recognizer: RefCell::new(None),
+            scroll_last: Cell::new(CGPoint { x: 0.0, y: 0.0 }),
         });
         let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
 
         this.setMultipleTouchEnabled(true);
+        this.observe_keyboard();
+        this.recognize_indirect_scroll();
 
         if let Some(scale_factor) = window_attributes.platform_specific.scale_factor {
             this.setContentScaleFactor(scale_factor as _);
@@ -849,6 +899,90 @@ impl WinitView {
         }
         let mtm = MainThreadMarker::new().unwrap();
         app_state::handle_nonuser_events(mtm, touch_events);
+    }
+
+    /// Tracks the soft keyboard: its overlap with the window joins the safe
+    /// area, and a relayout (`layoutSubviews`, which sends `Resized`) tells
+    /// the app to read it again.
+    fn observe_keyboard(&self) {
+        let center = unsafe { objc2_foundation::NSNotificationCenter::defaultCenter() };
+        let weak = objc2::rc::Weak::from_retained(&self.retain());
+        let changed = {
+            let weak = weak.clone();
+            move |notification: &objc2_foundation::NSNotification| {
+                let Some(view) = weak.load() else { return };
+                let frame: Option<CGRect> = unsafe {
+                    notification.userInfo().and_then(|info| {
+                        let key: &AnyObject = objc2_ui_kit::UIKeyboardFrameEndUserInfoKey.as_ref();
+                        let value: Option<Retained<AnyObject>> =
+                            msg_send_id![&*info, objectForKey: key];
+                        value.map(|v| msg_send![&*v, CGRectValue])
+                    })
+                };
+                view.set_keyboard_frame(frame);
+            }
+        };
+        let hidden = move |_: &objc2_foundation::NSNotification| {
+            if let Some(view) = weak.load() {
+                view.set_keyboard_frame(None);
+            }
+        };
+        let observers = unsafe {
+            vec![
+                super::notification_center::create_observer(
+                    &center,
+                    objc2_ui_kit::UIKeyboardWillChangeFrameNotification,
+                    changed,
+                ),
+                super::notification_center::create_observer(
+                    &center,
+                    objc2_ui_kit::UIKeyboardWillHideNotification,
+                    hidden,
+                ),
+            ]
+        };
+        *self.ivars().keyboard_observers.borrow_mut() = observers;
+    }
+
+    /// The keyboard's end frame in screen coordinates (`None`: hidden).
+    fn set_keyboard_frame(&self, frame: Option<CGRect>) {
+        let Some(window) = self.window() else { return };
+        let overlap = frame.map_or(0.0, |k| {
+            let screen_space = window.screen().coordinateSpace();
+            let w = self.convertRect_toCoordinateSpace(window.bounds(), &screen_space);
+            crate::platform_impl::ios_keyboard::keyboard_overlap(
+                (w.origin.x as f64, w.origin.y as f64, w.size.width as f64, w.size.height as f64),
+                (k.origin.x as f64, k.origin.y as f64, k.size.width as f64, k.size.height as f64),
+            ) as CGFloat
+        });
+        if self.ivars().keyboard_overlap.replace(overlap) != overlap {
+            unsafe { self.setNeedsLayout() };
+        }
+    }
+
+    /// How much of the window the keyboard covers, in points.
+    pub(crate) fn keyboard_overlap(&self) -> CGFloat {
+        self.ivars().keyboard_overlap.get()
+    }
+
+    /// Trackpad and mouse-wheel scrolling as `MouseWheel`: a pan recognizer
+    /// that takes indirect scroll input and no touches.
+    fn recognize_indirect_scroll(&self) {
+        let mtm = MainThreadMarker::from(self);
+        let pan = unsafe {
+            UIPanGestureRecognizer::initWithTarget_action(
+                mtm.alloc(),
+                Some(self),
+                Some(sel!(scrollGesture:)),
+            )
+        };
+        unsafe {
+            pan.setAllowedScrollTypesMask(objc2_ui_kit::UIScrollTypeMask::All);
+            pan.setAllowedTouchTypes(&NSArray::new());
+        }
+        pan.setDelegate(Some(ProtocolObject::from_ref(self)));
+        self.addGestureRecognizer(&pan);
+        self.ivars().scroll_gesture_recognizer.replace(Some(pan));
     }
 
     /// The position `offset` UTF-16 units from `position`, if inside the text.
