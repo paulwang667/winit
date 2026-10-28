@@ -5,6 +5,8 @@ use crate::window::Fullscreen as RootFullscreen;
 mod android;
 #[cfg(ios_platform)]
 mod ios;
+#[cfg(any(ios_platform, test))]
+pub(crate) mod ios_text_mirror;
 #[cfg(any(x11_platform, wayland_platform))]
 mod linux;
 #[cfg(macos_platform)]
