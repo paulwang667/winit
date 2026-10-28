@@ -76,6 +76,20 @@
 //! register an application delegate, so you can set up a custom one in a nib file instead.
 //!
 //! [app-delegate]: https://developer.apple.com/documentation/uikit/uiapplicationdelegate?language=objc
+//!
+//! ## The safe area and the soft keyboard
+//!
+//! [`Window::inner_size`] and [`Window::inner_position`] report the safe
+//! area (clear of the status bar, the Dynamic Island and the home
+//! indicator); [`Window::outer_size`] is the whole screen. In this fork the
+//! soft keyboard counts too: while it is up, the safe area's bottom edge is
+//! the keyboard's top, and each change is followed by a
+//! [`WindowEvent::Resized`](crate::event::WindowEvent::Resized) carrying the
+//! (unchanged) whole-screen size, so read the inner rect again then.
+//!
+//! [`Window::inner_size`]: crate::window::Window::inner_size
+//! [`Window::inner_position`]: crate::window::Window::inner_position
+//! [`Window::outer_size`]: crate::window::Window::outer_size
 
 use std::os::raw::c_void;
 
