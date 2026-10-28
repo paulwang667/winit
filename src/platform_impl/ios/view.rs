@@ -982,7 +982,12 @@ impl WinitView {
         };
         unsafe {
             pan.setAllowedScrollTypesMask(objc2_ui_kit::UIScrollTypeMask::All);
-            pan.setAllowedTouchTypes(&NSArray::new());
+            // Trackpad and wheel scrolls arrive as indirect-pointer input;
+            // an empty list filtered them out too. Fingers stay with the
+            // view's own touch handling.
+            let indirect_pointer =
+                objc2_foundation::NSNumber::new_isize(UITouchType::IndirectPointer.0);
+            pan.setAllowedTouchTypes(&NSArray::from_vec(vec![indirect_pointer]));
         }
         pan.setDelegate(Some(ProtocolObject::from_ref(self)));
         self.addGestureRecognizer(&pan);
